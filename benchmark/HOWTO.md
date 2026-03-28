@@ -314,43 +314,133 @@ Key details:
 
 All equations use **single-character index names** (TiledArray's Einstein parser). Multi-character names like `"i2,m1,k1"` cause crashes.
 
-**Eq2** — all 3 stages work:
+All equations use `einsum()` consistently (from `<TiledArray/expressions/einsum.h>`):
+
+**Eq2** — all 3 stages work on 1 rank:
 ```
-Stage 1: I0("i,m,p,n") = g("i,m,k") * g("p,n,k")              // operator* (pure contraction)
-Stage 2: I1 = einsum(I0("i,m,p,n"), c1("i,m,a"), "i,p,n,a")    // einsum (Hadamard i + contract m)
-Stage 3: R  = einsum(I1("i,p,n,a"), c2("p,q,n,b"), "p,i,a,q,b") // einsum (Hadamard p + contract n)
+Stage 1: I0 = einsum(g("i,m,k"), g("p,n,k"), "i,m,p,n")            // contract k
+Stage 2: I1 = einsum(I0("i,m,p,n"), c1("i,m,a"), "i,p,n,a")        // Hadamard i + contract m
+Stage 3: R  = einsum(I1("i,p,n,a"), c2("p,q,n,b"), "p,i,a,q,b")    // Hadamard p + contract n
 ```
 
-**Eq0** — stages 1-2 work, stage 3 uses einsum, but **I1 intermediate OOMs**:
+**Eq0** — all 3 stages work, but I1 OOMs on single node (needs multi-node):
 ```
-Stage 1: I0("n,k,i,a") = g0("m,n,k") * c("i,m,a")              // operator*
-Stage 2: I1("k,i,a,j,b") = I0("n,k,i,a") * c("j,n,b")          // operator* — OOM (I1 too large)
-Stage 3: R = einsum(g1("j,i,k"), I1("k,i,a,j,b"), "i,j,a,b")    // einsum
+Stage 1: I0 = einsum(g0("m,n,k"), c("i,m,a"), "n,k,i,a")           // contract m
+Stage 2: I1 = einsum(I0("n,k,i,a"), c("j,n,b"), "k,i,a,j,b")      // contract n (I1 is large)
+Stage 3: R  = einsum(g1("j,i,k"), I1("k,i,a,j,b"), "i,j,a,b")     // Hadamard i,j + contract k
 ```
 
-**Eq1** — same: stage 2 I1 is rank-6 and OOMs.
+**Eq1** — I1 is rank-6 and OOMs even on 4 nodes:
+```
+Stage 1: I0 = einsum(g0("m,n,k"), c2("i,j,m,a"), "n,k,i,j,a")     // contract m
+Stage 2: I1 = einsum(I0("n,k,i,j,a"), c2("j,p,n,b"), "j,k,i,a,p,b") // Hadamard j + contract n (OOM)
+Stage 3: R  = einsum(I1("j,k,i,a,p,b"), g1("i,p,k"), "i,p,j,a,b") // Hadamard i,p + contract k
+```
 
-### Results: C3H8, Eq2
+### Results: C3H8, Eq2 (single-node scaling)
 
 | Config | Stage 1 | Stage 2 | Stage 3 | Total |
 |--------|---------|---------|---------|-------|
 | Dense, 1 proc, 16 BLAS threads | 0.18s | 0.41s | 26.1s | **26.7s** |
 | TiledArray, 1 MPI rank | 0.07s | 0.09s | 1.01s | **1.18s** |
-| TiledArray, 2 MPI ranks | 1.09s | 1.36s | 5.97s | 6.36s |
-| TiledArray, 4 MPI ranks | 1.09s | 1.36s | 5.97s | 8.18s |
+| TiledArray, 2 MPI ranks (single node) | 1.09s | 1.36s | 5.97s | 6.36s |
+| TiledArray, 4 MPI ranks (single node) | 1.09s | 1.36s | 5.97s | 8.18s |
 
 **1-rank TiledArray is 22x faster than the dense baseline** because:
 - Tile-level sparsity: c1 is 72.5% sparse, c2 is 74.4% sparse — many tiles are zero and skipped entirely
 - The result R has 92.4% sparsity — most output tiles are never computed
 - Stage 3 (the bottleneck) does far fewer tile GEMMs than the dense baseline's element-level loops
 
-Multi-rank is slower on this small problem due to MPI communication overhead dominating the ~1s computation time.
+Multi-rank on a single node is slower for this small problem — MPI communication overhead dominates the ~1s computation.
+
+### Multi-node setup (4 CloudLab nodes)
+
+**Prerequisites on each node:**
+```bash
+sudo apt-get update && sudo apt-get install -y mpich libopenblas-dev
+```
+
+**SSH key distribution:** CloudLab nodes have root-to-root SSH pre-configured. We generate a user key on one node and distribute it via `sudo ssh`:
+
+```bash
+# On node1 (or any node):
+ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ""
+cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+
+# Distribute to other nodes via root SSH:
+PUBKEY=$(cat ~/.ssh/id_ed25519.pub)
+for node in node0 node2 node3; do
+  sudo ssh -o StrictHostKeyChecking=no "$node" \
+    "echo '$PUBKEY' >> /users/jianjian/.ssh/authorized_keys"
+done
+
+# Verify:
+for node in node0 node1 node2 node3; do
+  ssh -o StrictHostKeyChecking=no "$node" hostname
+done
+```
+
+**Data replication:** No shared filesystem on CloudLab experiment network. Must rsync to each node:
+
+```bash
+for node in node0 node2 node3; do
+  ssh "$node" "mkdir -p /users/jianjian/sptc-dist/benchmark/build \
+                         /users/jianjian/sptc-dist/dataset \
+                         /users/jianjian/sptc-dist/tiledarray"
+
+  # Binaries + TiledArray install (~170 MB)
+  rsync -az benchmark/build/ta_benchmark "$node":/users/jianjian/sptc-dist/benchmark/build/
+  rsync -az ../tiledarray/install/ "$node":/users/jianjian/sptc-dist/tiledarray/install/
+
+  # Dataset (~9.2 GB)
+  rsync -az ../dataset/data_fusedsptc/ "$node":/users/jianjian/sptc-dist/dataset/data_fusedsptc/
+done
+```
+
+**Hostfile** (`benchmark/hostfile`):
+```
+node0:8
+node1:8
+node2:8
+node3:8
+```
+
+**Running multi-node benchmark:**
+```bash
+cd benchmark
+OPENBLAS_NUM_THREADS=1 SPTC_TRIALS=1 \
+  mpirun -f hostfile -np 4 -ppn 1 -iface eno1d1 \
+  ./build/ta_benchmark ../dataset/data_fusedsptc/C3H8
+```
+
+Key flags:
+- `-f hostfile` — node list with max processes per node
+- `-np 4` — total MPI ranks
+- `-ppn 1` — processes per node (1 rank per node to maximize memory)
+- `-iface eno1d1` — use the 10 GbE cluster interconnect (10.10.1.0/24), not the public interface
+
+### Results: C3H8, multi-node (4 nodes, 1 rank per node)
+
+| Equation | Dense baseline | TA, 1 node | TA, 4 nodes | Notes |
+|----------|---------------|------------|-------------|-------|
+| **Eq2** | 26.7s | 1.18s | 2.33s | 22x faster than dense; multi-node adds overhead for small problem |
+| **Eq0** | 352s | OOM | **141.8s** | Only works multi-node — I1 distributed across 4×64 GB |
+| **Eq1** | 51.4s | OOM | OOM | Rank-6 I1 too large even for 4×64 GB; needs 8+ nodes or smaller tiles |
+
+**Eq0 breakdown (4 nodes):**
+
+| Stage | Time | Sparsity | Peak RSS/node |
+|-------|------|----------|---------------|
+| Stage 1: I0 = g0 * c | 0.46s | 70.8% | 2.2 GB |
+| Stage 2: I1 = I0 * c | 9.12s | 91.5% | 17.5 GB |
+| Stage 3: R = g1 * I1 | 132.2s | 91.5% | 26.5 GB |
+| **Total** | **141.8s** | | |
 
 ### Remaining work
 
-1. **Eq0/Eq1 fused implementations:** Need manual tile iteration (via `TA::foreach` or tile-level loops) to avoid materializing the huge I1 intermediates, similar to the dense baseline's fused approach.
-2. **Multi-node scaling:** Requires SSH key setup between CloudLab nodes (node0-3) and dataset replication (no shared filesystem).
-3. **Larger molecules:** C5H12+ with multi-node distribution to study weak scaling.
+1. **Eq1:** Needs 8+ nodes, smaller tile sizes (try RI=25), or a fused implementation to avoid the rank-6 intermediate.
+2. **Larger molecules:** C4H10+ for weak scaling study.
+3. **More ranks per node:** Try `-ppn 2` or `-ppn 4` for nodes with enough memory headroom.
 
 ### Environment details
 
@@ -359,5 +449,5 @@ Multi-rank is slower on this small problem due to MPI communication overhead dom
 - **MPI:** MPICH 4.0 (Hydra launcher, ch4:ofi device)
 - **Compiler:** GCC 11, C++20
 - **BLAS:** OpenBLAS (LP64)
-- **TiledArray:** v1.1.0 from git submodule, built with Pthreads backend + `-fno-lto`
-- **Cluster network:** 10.10.1.0/24 on eno1d1 (no shared filesystem)
+- **TiledArray:** v1.1.0 from git submodule, unmodified source, built with Pthreads backend + `-fno-lto`
+- **Cluster network:** 10.10.1.0/24 on eno1d1 (no shared filesystem, data replicated via rsync)

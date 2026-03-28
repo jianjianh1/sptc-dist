@@ -30,7 +30,31 @@ The tensor dimensions grow with molecular size:
 
 The g0 tensor (largest, driving cost) grows as O(n_uocc^2 * n_ri) ~ O(N^3) with molecular size. The occupied dimension n_occ grows linearly. The virtual dimension n_virt grows approximately linearly.
 
-**Element-level sparsity of g0:** g0 nnz / (n_uocc^2 * n_ri) gives: C3H8 = 100%, C4H10 = 100%, C5H12 = 100%, C6H14 = 99.5%. The g0 tensor is essentially dense at the element level. TiledArray stores it fully because tile-level sparsity is 0% (stage 1 sparsity column in the data shows 0% for C3H8 and ~27-36% for larger molecules, but only at the I0 output level).
+**Element-level sparsity of g0:** g0 nnz / (n_uocc^2 * n_ri) gives: C3H8 = 100%, C4H10 = 100%, C5H12 = 100%, C6H14 = 99.5%. The g0 tensor is essentially dense at the element level. TiledArray stores it fully because tile-level sparsity is 0%.
+
+### 2.1 Input Tensor Block-Sparsity Analysis
+
+The input tensors have two distinct sparsity profiles. The **g tensors** (three-center RI integrals) are dense at both element and tile level. The **c tensors** (orbital coefficients) have strong block sparsity from DLPNO's localized pair domains, with sparsity increasing as molecules grow:
+
+| Tensor | Type | C3H8 tile sparsity | C6H14 tile sparsity | Intra-tile fill (C3H8) |
+|--------|------|-------------------|---------------------|----------------------|
+| g0 (n_uocc, n_uocc, n_ri) | RI integrals | **0.0%** | **0.0%** | 100% |
+| g1 (n_occ, n_occ, n_ri) | RI integrals | **0.0%** | **0.0%** | 61% |
+| g (n_occ, n_uocc, n_ri) | RI integrals | **0.0%** | **0.0%** | 77% |
+| c1 (n_occ, n_uocc, n_virt) | Orbital coefficients | **72.5%** | **86.0%** | 4.5% |
+| c2 (n_occ, n_occ, n_uocc, n_virt) | Orbital coefficients | **74.4%** | **90.2%** | 0.6% |
+
+Tile sizes: occ=4, uocc=50, ri=200 (matching MPQC input.json). Smaller tiles (e.g., uocc=25) increase tile sparsity marginally (c1: 72.5%→75.3%, c2: 74.4%→78.8%) but do not reveal any block sparsity in the g tensors.
+
+**Key implications:**
+
+1. **TiledArray correctly exploits c1/c2 block sparsity.** The 23x Eq2 speedup vs dense baseline is primarily driven by skipping zero c1/c2 tiles in stages 2-3. The output R tensor achieves 92.8% (C3H8) to 98.6% (C6H14) tile sparsity from the propagation of input sparsity through contractions.
+
+2. **g0 has no exploitable block structure at any tile size.** Even with [25,25,50] tiles (810 tiles), all tiles are nonzero. The RI auxiliary basis produces fundamentally dense integrals. Since g0 is the largest tensor (19.7M entries for C3H8, 127.5M for C6H14) and the first operand in Eq0/Eq1 stage 1, this limits sparsity gains in those equations.
+
+3. **Intra-tile sparsity is wasted by TiledArray's dense storage.** c1 tiles at [4,50,50] are only 4.5% filled (4500 out of 10000 element positions occupied on average). c2 tiles at [4,4,50,50] are only 0.6% filled. TiledArray stores every nonzero tile as a fully dense block, padding the remaining 95-99% with zeros. A library using element-level compressed formats (CSR, COO) within tiles could reduce memory by 20-100x for these tensors.
+
+4. **Sparsity scaling with molecule size is favorable.** c1 sparsity increases from 72.5% to 86.0% and c2 from 74.4% to 90.2% between C3H8 and C6H14. This means the compute savings from TiledArray's tile-level screening improve with molecular size, partially offsetting the cubic growth in tensor dimensions.
 
 ---
 

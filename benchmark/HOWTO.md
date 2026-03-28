@@ -436,6 +436,25 @@ Key flags:
 | Stage 3: R = g1 * I1 | 132.2s | 91.5% | 26.5 GB |
 | **Total** | **141.8s** | | |
 
+### Optimization audit: ensuring author-intended usage
+
+An audit was performed to verify our TiledArray usage matches what the authors intended, based on MPQC patterns, TiledArray source code, and documentation. Changes made:
+
+1. **RI tile size 50 → 200** to match MPQC's `tile_size=200` from `input.json`. Larger RI tiles improve BLAS throughput. The occ=4 and uocc=50 settings already matched.
+
+2. **3-pass COO builder** to skip non-local entries. Pass 1 computes tile norms (all ranks need this for `SparseShape`). Pass 2 creates the shape and array (determines tile ownership). Pass 3 re-scans COO entries but only groups entries for local tiles. Reduces per-rank memory and construction time by ~nranks for multi-rank runs.
+
+3. **Eager intermediate release** between stages: `I0 = TA::TSpArrayD(); TA::TSpArrayD::wait_for_lazy_cleanup(world);` after stage 2 starts. Frees stage-1 memory before stage 3 allocates.
+
+4. **Default sparse threshold** (~1.19e-7) instead of 1e-10. Matches MPQC/TiledArray defaults. The previous 1e-10 was overly conservative and kept tiles that MPQC would prune.
+
+Items verified as already correct (no change needed):
+
+- **einsum() for all stages** — for pure contractions, `einsum()` internally delegates to `operator*` with zero overhead. Using einsum consistently is correct.
+- **Contraction order** — matches the staged decomposition from `dataset_context.md` and MPQC usage.
+- **Process map** — TiledArray's contraction engine creates its own SUMMA grid internally; the input pmap doesn't affect contraction performance.
+- **`openblas_set_num_threads(1)`** — critical and correct; TiledArray only throttles BLAS threading for Intel MKL, not OpenBLAS.
+
 ### Remaining work
 
 1. **Eq1:** Needs 8+ nodes, smaller tile sizes (try RI=25), or a fused implementation to avoid the rank-6 intermediate.

@@ -1,0 +1,3 @@
+[submodule "tiledarray"]
+	path = tiledarray
+	url = https://github.com/ValeevGroup/tiledarray.git

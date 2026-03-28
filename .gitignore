@@ -1,5 +1,7 @@
-# Third-party library (clone + build artifacts)
-tiledarray/
+# TiledArray build artifacts (source tracked as submodule)
+tiledarray/build/
+tiledarray/build_debug/
+tiledarray/install/
 
 # Dataset (download via download_molecules.sh)
 dataset/data_fusedsptc/

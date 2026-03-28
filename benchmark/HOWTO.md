@@ -204,9 +204,160 @@ Timings are medians of 3 trials (values very stable, <1% variance):
 
 ---
 
-## Potential improvements
+## Potential improvements (dense baseline)
 
 1. **Eq0 gather elimination:** Reshape I0 from (u2,k1,i1,a1) to (k1,i1,u2,a1) via a one-time permutation so the fused loop accesses contiguous memory.
 2. **Sparse skipping:** The g1 tensor is very sparse for off-diagonal (i2,i1) pairs. Skipping zero g1 values (already done via `if (g1_val == 0.0) continue`) helps but could be improved with a compressed nonzero list.
 3. **Blocking for cache:** The eq2 stage 3 temp buffer allocation inside the inner loop could be hoisted.
 4. **Larger molecules:** C4H10+ will need more memory (g0 grows quadratically). May need out-of-core or tiled approaches for C6H14+.
+
+---
+
+## Attempt 3: TiledArray distributed benchmark (partially succeeded)
+
+### Overview
+
+Revisited TiledArray after diagnosing and fixing the MADNESS deadlock. The distributed benchmark uses TiledArray's sparse tiled arrays and Einstein-notation expression engine. Eq2 works and is 22x faster than the dense baseline. Eq0/Eq1 OOM due to large intermediate tensors.
+
+### Files
+
+```
+benchmark/
+├── ta_benchmark_main.cpp   # Distributed benchmark harness (MPI timing, CSV)
+├── ta_builder.h            # COO → TSpArrayD batched tile construction
+├── ta_equations.h          # Three equations as staged TA expressions
+├── ta_smoke_test.cpp       # Minimal test for verifying TA functionality
+└── run_scaling_study.sh    # Strong + weak scaling sweep script
+```
+
+### What was changed in external code
+
+**No changes needed in the installed TiledArray.** The working build uses the Pthreads backend with `-fno-lto`. The `vector_op.h` patch in the repo (visible in `git diff` within the `tiledarray/` submodule) was from an abandoned attempt to use the TBB backend with oneAPI TBB 2021 and is NOT used by the installed build.
+
+### Bug 1: MADNESS deadlock — root cause and fix
+
+**Symptom:** After `fill()` + `fence()`, all Einstein-notation expressions hang indefinitely. Even trivial `B("i,j") = 2.0 * A("i,j")` on a 10x20 dense array deadlocks. High CPU usage (workers spinning) but no progress. Affects all TiledArray examples (`ta_dense`, `ta_sparse`, `demo`).
+
+**Root cause:** Ubuntu 22.04's MPICH 4.0 package wraps `mpicxx` with `-flto=auto -ffat-lto-objects`. GCC 11's Link-Time Optimization mishandles `inline static thread_local` variables in MADNESS's `DQueue` task prebuffer (`dqueue.h` lines 93-95). Tasks submitted to the thread pool get stuck in corrupted thread-local prebuffers and never reach the shared queue. Worker threads see an empty queue and block, while the main thread waits in `ThreadPool::await()` for results that never arrive.
+
+**Why `fill()` works but expressions don't:** `fill()` sets tile Futures directly without going through the MADNESS task queue. Expression evaluation submits fine-grained tasks through the DQueue, which is the broken code path.
+
+**Why `MAD_NUM_THREADS=1` and `OPENBLAS_NUM_THREADS=1` don't help:** The bug is in the LTO-corrupted prebuffer logic, not thread contention.
+
+**Fix:** Add `-fno-lto` to ALL builds (both TiledArray and the benchmark):
+
+```bash
+# Rebuild TiledArray
+cd tiledarray
+cmake -B build_nolto \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX=install \
+  -DCMAKE_CXX_FLAGS="-fno-lto" \
+  -DCMAKE_C_FLAGS="-fno-lto" \
+  -DENABLE_MPI=ON \
+  .
+cmake --build build_nolto -j$(nproc)
+cmake --build build_nolto --target install
+
+# Rebuild benchmark (MUST also use -fno-lto)
+cd benchmark
+cmake -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH="$(pwd)/../tiledarray/install" \
+  -DCMAKE_CXX_FLAGS="-fno-lto" \
+  -DCMAKE_C_FLAGS="-fno-lto" \
+  .
+cmake --build build -j$(nproc)
+```
+
+**Verification:** `OPENBLAS_NUM_THREADS=1 mpirun -np 1 ./build/ta_smoke_test` should print "All tests passed!".
+
+### Bug 2: Hadamard + contraction crash
+
+**Symptom:** TiledArray's `operator*` expression crashes (SIGFPE or SIGSEGV in `SparseShape::perm`) when an index appears in both operands as a non-contracted (Hadamard) index alongside other contracted indices. Example: `I1("i,p,n,a") = I0("i,m,p,n") * c1("i,m,a")` — `i` is Hadamard (kept), `m` is contracted.
+
+**Fix:** Use `TA::einsum()` (from `<TiledArray/expressions/einsum.h>`) instead of `operator*` for these mixed patterns:
+
+```cpp
+// CRASHES:
+I1("i,p,n,a") = I0("i,m,p,n") * c1("i,m,a");
+
+// WORKS:
+auto I1 = TA::einsum(I0("i,m,p,n"), c1("i,m,a"), "i,p,n,a");
+```
+
+This affects Eq2 stages 2-3, Eq0 stage 3, and Eq1 stages 2-3.
+
+### Bug 3 (abandoned): TBB backend + oneAPI TBB API incompatibility
+
+An attempt was made to switch from Pthreads to TBB backend (`-DMADNESS_TASK_BACKEND=TBB`). This required:
+1. Installing `libtbb-dev` (oneAPI TBB 2021.5.0)
+2. Creating a symlink: `sudo ln -s /usr/include/oneapi/tbb/version.h /usr/include/tbb/tbb_stddef.h`
+3. Patching `tiledarray/src/TiledArray/math/vector_op.h` to `#undef HAVE_INTEL_TBB` (disabling TBB for vector ops which use incompatible legacy TBB API)
+
+The TBB build compiled and installed, but expressions still deadlocked (the `-fno-lto` fix was not yet discovered). Once `-fno-lto` was found to fix the Pthreads backend, the TBB approach was abandoned. **The `vector_op.h` patch in the repo is from this abandoned attempt and is not needed.**
+
+### COO → TSpArrayD builder (`ta_builder.h`)
+
+Batched algorithm (avoids the `fill(0.0)` + `find().get()[]` pattern which causes heap corruption):
+
+1. **Pass 1:** Scan all COO entries. For each entry, compute its tile index via `trange.element_to_tile()`. Accumulate squared Frobenius norms per tile. Group entries by tile ordinal in a `std::map`.
+
+2. **Pass 2:** Create `SparseShape<float>` from tile norms. Construct `TSpArrayD`. For each local non-zero tile, create a `Tensor<double>` filled with zeros, set values from the grouped entries, and call `array.set(ord, tile)`.
+
+Key details:
+- `SparseShape<float>::threshold(1e-10f)` must be set to avoid over-pruning
+- Element indices must use `std::vector<long>` (not `size_t`) due to TiledArray's `small_vector<long, 8>` index type
+- Tile sizes: occ=4, uocc=50, RI=50 (from `input.json` but RI reduced from 200)
+
+### Equation implementations (`ta_equations.h`)
+
+All equations use **single-character index names** (TiledArray's Einstein parser). Multi-character names like `"i2,m1,k1"` cause crashes.
+
+**Eq2** — all 3 stages work:
+```
+Stage 1: I0("i,m,p,n") = g("i,m,k") * g("p,n,k")              // operator* (pure contraction)
+Stage 2: I1 = einsum(I0("i,m,p,n"), c1("i,m,a"), "i,p,n,a")    // einsum (Hadamard i + contract m)
+Stage 3: R  = einsum(I1("i,p,n,a"), c2("p,q,n,b"), "p,i,a,q,b") // einsum (Hadamard p + contract n)
+```
+
+**Eq0** — stages 1-2 work, stage 3 uses einsum, but **I1 intermediate OOMs**:
+```
+Stage 1: I0("n,k,i,a") = g0("m,n,k") * c("i,m,a")              // operator*
+Stage 2: I1("k,i,a,j,b") = I0("n,k,i,a") * c("j,n,b")          // operator* — OOM (I1 too large)
+Stage 3: R = einsum(g1("j,i,k"), I1("k,i,a,j,b"), "i,j,a,b")    // einsum
+```
+
+**Eq1** — same: stage 2 I1 is rank-6 and OOMs.
+
+### Results: C3H8, Eq2
+
+| Config | Stage 1 | Stage 2 | Stage 3 | Total |
+|--------|---------|---------|---------|-------|
+| Dense, 1 proc, 16 BLAS threads | 0.18s | 0.41s | 26.1s | **26.7s** |
+| TiledArray, 1 MPI rank | 0.07s | 0.09s | 1.01s | **1.18s** |
+| TiledArray, 2 MPI ranks | 1.09s | 1.36s | 5.97s | 6.36s |
+| TiledArray, 4 MPI ranks | 1.09s | 1.36s | 5.97s | 8.18s |
+
+**1-rank TiledArray is 22x faster than the dense baseline** because:
+- Tile-level sparsity: c1 is 72.5% sparse, c2 is 74.4% sparse — many tiles are zero and skipped entirely
+- The result R has 92.4% sparsity — most output tiles are never computed
+- Stage 3 (the bottleneck) does far fewer tile GEMMs than the dense baseline's element-level loops
+
+Multi-rank is slower on this small problem due to MPI communication overhead dominating the ~1s computation time.
+
+### Remaining work
+
+1. **Eq0/Eq1 fused implementations:** Need manual tile iteration (via `TA::foreach` or tile-level loops) to avoid materializing the huge I1 intermediates, similar to the dense baseline's fused approach.
+2. **Multi-node scaling:** Requires SSH key setup between CloudLab nodes (node0-3) and dataset replication (no shared filesystem).
+3. **Larger molecules:** C5H12+ with multi-node distribution to study weak scaling.
+
+### Environment details
+
+- **Platform:** CloudLab, 4 nodes (node0-3), Intel Xeon D-1548 (8 cores, 64 GB RAM each)
+- **OS:** Ubuntu 22.04, Linux 5.15
+- **MPI:** MPICH 4.0 (Hydra launcher, ch4:ofi device)
+- **Compiler:** GCC 11, C++20
+- **BLAS:** OpenBLAS (LP64)
+- **TiledArray:** v1.1.0 from git submodule, built with Pthreads backend + `-fno-lto`
+- **Cluster network:** 10.10.1.0/24 on eno1d1 (no shared filesystem)

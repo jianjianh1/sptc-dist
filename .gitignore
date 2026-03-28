@@ -1,0 +1,19 @@
+# Third-party library (clone + build artifacts)
+tiledarray/
+
+# Dataset (download via download_molecules.sh)
+dataset/data_fusedsptc/
+
+# Build artifacts
+benchmark/build/
+build/
+*.o
+*.a
+*.so
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store

@@ -23,7 +23,7 @@ static constexpr int NUM_TRIALS = 3;
 struct TileConfig {
   std::size_t occ  = 4;    // occupied orbital indices (i1, i2, i3, i5)
   std::size_t uocc = 50;   // unoccupied/auxiliary (m, u, a)
-  std::size_t ri   = 50;   // RI auxiliary basis (k1/K1) — reduced from 200
+  std::size_t ri   = 200;  // RI auxiliary basis (k1/K1) — matches MPQC input.json
 };
 
 /// Print CSV header (rank 0 only).
@@ -115,8 +115,8 @@ int main(int argc, char* argv[]) {
 
   TiledArray::World& world = TA_SCOPED_INITIALIZE(argc, argv);
 
-  // Set sparse threshold to avoid pruning nearly-zero tiles
-  TA::SparseShape<float>::threshold(1e-10f);
+  // Use TiledArray's default sparse threshold to match MPQC behavior.
+  // Default is numeric_limits<float>::epsilon() ~ 1.19e-7.
 
   if (argc < 2) {
     if (world.rank() == 0) print_usage(argv[0]);

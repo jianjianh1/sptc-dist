@@ -28,17 +28,12 @@ inline TA::TiledRange make_trange(const std::vector<std::size_t>& shape,
   return TA::TiledRange(tr1s.begin(), tr1s.end());
 }
 
-/// Flatten a multi-dimensional tile index into a single ordinal.
-inline std::size_t tile_ordinal(const std::vector<long>& tile_idx,
-                                const TA::Range& tiles_range) {
-  return tiles_range.ordinal(tile_idx);
-}
-
 /// Convert a COOTensor into a distributed TiledArray sparse array.
 ///
-/// Batched algorithm:
-///   Pass 1: Compute Frobenius norm per tile + group COO entries by tile ordinal.
-///   Pass 2: Create sparse array, then set each local tile from its batch.
+/// Three-pass algorithm:
+///   Pass 1: Scan all entries, compute tile norms (all ranks, for SparseShape).
+///   Pass 2: Create sparse shape and array (determines tile ownership).
+///   Pass 3: Re-scan entries, only group entries for LOCAL tiles, set tiles.
 inline TA::TSpArrayD build_sparse_array(TA::World& world,
                                         const COOTensor& coo,
                                         const std::vector<std::size_t>& tile_sizes,
@@ -48,10 +43,25 @@ inline TA::TSpArrayD build_sparse_array(TA::World& world,
   TA::TiledRange trange = make_trange(shape, tile_sizes);
   const auto& tiles_range = trange.tiles_range();
 
-  // Pass 1: compute tile norms and group entries by tile
+  // Pass 1: compute tile norms (all ranks need this for SparseShape)
   TA::Tensor<float> tile_norms(tiles_range, 0.0f);
 
-  // Map: tile ordinal -> list of (element_index, value)
+  for (std::size_t i = 0; i < coo.values.size(); ++i) {
+    std::vector<long> elem_idx(coo.rank);
+    for (int d = 0; d < coo.rank; ++d)
+      elem_idx[d] = static_cast<long>(coo.indices[i][d]);
+
+    auto tidx = trange.element_to_tile(elem_idx);
+    float val = static_cast<float>(coo.values[i]);
+    tile_norms[tidx] += val * val;
+  }
+  tile_norms.inplace_unary([](float& x) { x = std::sqrt(x); });
+
+  // Pass 2: create sparse shape and array (determines tile-to-rank mapping)
+  TA::SparseShape<float> sp_shape(world, tile_norms, trange);
+  TA::TSpArrayD array(world, trange, sp_shape);
+
+  // Pass 3: re-scan entries, only collect entries for local non-zero tiles
   using ElemEntry = std::pair<std::vector<long>, double>;
   std::map<std::size_t, std::vector<ElemEntry>> tile_entries;
 
@@ -63,40 +73,25 @@ inline TA::TSpArrayD build_sparse_array(TA::World& world,
     auto tidx = trange.element_to_tile(elem_idx);
     auto ord = tiles_range.ordinal(tidx);
 
-    float val = static_cast<float>(coo.values[i]);
-    tile_norms[tidx] += val * val;
+    if (array.is_zero(ord) || !array.is_local(ord)) continue;
     tile_entries[ord].emplace_back(std::move(elem_idx), coo.values[i]);
   }
 
-  // Convert squared norms to norms
-  tile_norms.inplace_unary([](float& x) { x = std::sqrt(x); });
-
-  // Pass 2: create sparse shape and array
-  TA::SparseShape<float> sp_shape(world, tile_norms, trange);
-  TA::TSpArrayD array(world, trange, sp_shape);
-
-  // Set each local non-zero tile by constructing a Tensor and assigning it
+  // Set each local tile
   for (auto& [ord, entries] : tile_entries) {
-    if (array.is_zero(ord) || !array.is_local(ord)) continue;
-
-    // Get the tile's element range
     auto tile_range = trange.make_tile_range(ord);
     TA::Tensor<double> tile(tile_range, 0.0);
-
-    for (auto& [idx, val] : entries) {
+    for (auto& [idx, val] : entries)
       tile[idx] = val;
-    }
-
     array.set(ord, std::move(tile));
   }
 
-  // Set any remaining local non-zero tiles that had no COO entries to zero
+  // Set remaining local non-zero tiles (no COO entries) to zero
   for (auto it = array.begin(); it != array.end(); ++it) {
     auto ord = it.ordinal();
     if (!array.is_zero(ord) && array.is_local(ord) &&
         tile_entries.find(ord) == tile_entries.end()) {
-      auto tile_range = trange.make_tile_range(ord);
-      array.set(ord, TA::Tensor<double>(tile_range, 0.0));
+      array.set(ord, TA::Tensor<double>(trange.make_tile_range(ord), 0.0));
     }
   }
 

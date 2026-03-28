@@ -78,6 +78,8 @@ inline std::vector<TAStageResult> ta_run_eq2(TA::World& world,
   auto t2c = Clock::now();
   world.gop.fence();
   auto t2e = Clock::now();
+  I0 = TA::TSpArrayD();  // release stage-1 intermediate
+  TA::TSpArrayD::wait_for_lazy_cleanup(world);
   results.push_back({"eq2", "stage2",
                      std::chrono::duration<double>(t2e - t2s).count(),
                      std::chrono::duration<double>(t2c - t2s).count(),
@@ -139,6 +141,8 @@ inline std::vector<TAStageResult> ta_run_eq0(TA::World& world,
   auto t2c = Clock::now();
   world.gop.fence();
   auto t2e = Clock::now();
+  I0 = TA::TSpArrayD();  // release stage-1 intermediate
+  TA::TSpArrayD::wait_for_lazy_cleanup(world);
   results.push_back({"eq0", "stage2",
                      std::chrono::duration<double>(t2e - t2s).count(),
                      std::chrono::duration<double>(t2c - t2s).count(),
@@ -201,6 +205,8 @@ inline std::vector<TAStageResult> ta_run_eq1(TA::World& world,
   auto t2c = Clock::now();
   world.gop.fence();
   auto t2e = Clock::now();
+  I0 = TA::TSpArrayD();  // release stage-1 intermediate
+  TA::TSpArrayD::wait_for_lazy_cleanup(world);
   results.push_back({"eq1", "stage2",
                      std::chrono::duration<double>(t2e - t2s).count(),
                      std::chrono::duration<double>(t2c - t2s).count(),

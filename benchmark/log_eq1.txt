@@ -1,0 +1,25 @@
+=== C2H6 ===
+>>> eq1-C2H6-1rank (np=1 ppn=1 mol=C2H6)
+FAILED eq1-C2H6-1rank (timeout or error)
+>>> eq1-C2H6-4node (np=4 ppn=1 mol=C2H6)
+>>> eq1-C2H6-8node (np=8 ppn=1 mol=C2H6)
+>>> eq1-C2H6-16node (np=16 ppn=1 mol=C2H6)
+>>> eq1-C2H6-32node (np=32 ppn=1 mol=C2H6)
+=== C3H8 ===
+>>> eq1-C3H8-4node (np=4 ppn=1 mol=C3H8)
+FAILED eq1-C3H8-4node (timeout or error)
+>>> eq1-C3H8-8node (np=8 ppn=1 mol=C3H8)
+FAILED eq1-C3H8-8node (timeout or error)
+>>> eq1-C3H8-16node (np=16 ppn=1 mol=C3H8)
+FAILED eq1-C3H8-16node (timeout or error)
+>>> eq1-C3H8-32node (np=32 ppn=1 mol=C3H8)
+FAILED eq1-C3H8-32node (timeout or error)
+=== C4H10 ===
+>>> eq1-C4H10-8node (np=8 ppn=1 mol=C4H10)
+FAILED eq1-C4H10-8node (timeout or error)
+>>> eq1-C4H10-16node (np=16 ppn=1 mol=C4H10)
+FAILED eq1-C4H10-16node (timeout or error)
+>>> eq1-C4H10-32node (np=32 ppn=1 mol=C4H10)
+FAILED eq1-C4H10-32node (timeout or error)
+=== C5H12 ===
+>>> eq1-C5H12-16node (np=16 ppn=1 mol=C5H12)

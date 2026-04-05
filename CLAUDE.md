@@ -48,6 +48,10 @@ cmake -B build \
   .
 ```
 
+## Benchmark Rules
+
+- **No dense GEMM baselines.** Only benchmark with TiledArray's tile-sparse implementation (`ta_equations.h`, `ta_benchmark_main.cpp`). Dense OpenBLAS implementations have been removed.
+
 ## Architecture: The Three Contraction Equations
 
 The benchmark targets three multi-tensor contractions from DLPNO-CCSD, each decomposed into 3 staged contractions:
